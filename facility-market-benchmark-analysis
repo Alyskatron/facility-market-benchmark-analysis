@@ -1,0 +1,228 @@
+WITH dedup_purchase AS (
+    SELECT *
+    FROM (
+        SELECT
+            p.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY p.po_number, p.po_line_number
+                ORDER BY p.po_date DESC
+            ) AS rn
+        FROM purchase_data p
+        WHERE p.contract_type = 'On Contract'
+          AND DATE(p.po_date) BETWEEN '2024-01-01' AND '2025-12-31'
+    )
+    WHERE rn = 1
+),
+
+monthly_prices AS (
+    SELECT 
+        product_id,
+        product_description,
+        category_name,
+        manufacturer_name,
+        facility_name,
+        DATE_TRUNC('MONTH', po_date) AS year_month,
+        AVG(
+            CASE 
+                WHEN uom_quantity > 0 
+                    THEN uom_price / uom_quantity
+                ELSE unit_price
+            END
+        ) AS avg_unit_price,
+        SUM(line_amount) AS total_spend,
+        SUM(purchase_quantity) AS total_quantity
+    FROM dedup_purchase
+    GROUP BY 1,2,3,4,5,6
+),
+
+monthly_prices_clean AS (
+    SELECT *
+    FROM (
+        SELECT
+            *,
+            PERCENTILE_APPROX(avg_unit_price, 0.25) OVER (PARTITION BY product_id) AS q1,
+            PERCENTILE_APPROX(avg_unit_price, 0.75) OVER (PARTITION BY product_id) AS q3,
+            PERCENTILE_APPROX(avg_unit_price, 0.75) OVER (PARTITION BY product_id)
+              - PERCENTILE_APPROX(avg_unit_price, 0.25) OVER (PARTITION BY product_id) AS iqr
+        FROM monthly_prices
+    )
+    WHERE 
+        iqr IS NULL
+        OR iqr = 0
+        OR avg_unit_price BETWEEN (q1 - 1.5 * iqr) AND (q3 + 1.5 * iqr)
+),
+
+target_quarterly_data AS (
+    SELECT 
+        product_id,
+        product_description,
+        category_name,
+        manufacturer_name,
+        CASE 
+            WHEN year_month BETWEEN '2024-07-01' AND '2024-09-30' THEN 'Q3_2024'
+            WHEN year_month BETWEEN '2024-10-01' AND '2024-12-31' THEN 'Q4_2024'
+            WHEN year_month BETWEEN '2025-07-01' AND '2025-09-30' THEN 'Q3_2025'
+            WHEN year_month BETWEEN '2025-10-01' AND '2025-12-31' THEN 'Q4_2025'
+        END AS quarter_flag,
+        AVG(avg_unit_price) AS avg_unit_price_quarter,
+        SUM(total_spend) AS total_spend_quarter,
+        SUM(total_quantity) AS total_quantity_quarter
+    FROM monthly_prices_clean
+    WHERE UPPER(facility_name) = 'TARGET_FACILITY'
+    GROUP BY 1,2,3,4,5
+),
+
+last_price_pre_q3_2024 AS (
+    SELECT 
+        product_id,
+        product_description,
+        category_name,
+        avg_unit_price AS last_price_before_q3_2024
+    FROM (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY product_id, product_description, category_name
+                ORDER BY year_month DESC
+            ) AS rn
+        FROM monthly_prices_clean
+        WHERE year_month < '2024-07-01'
+          AND UPPER(facility_name) = 'TARGET_FACILITY'
+    )
+    WHERE rn = 1
+),
+
+target_quarter_comparison AS (
+    SELECT
+        q.product_id,
+        q.product_description,
+        q.category_name,
+        q.manufacturer_name,
+        COALESCE(
+            MAX(CASE WHEN quarter_flag = 'Q3_2024' THEN avg_unit_price_quarter END),
+            lp.last_price_before_q3_2024
+        ) AS avg_price_q3_2024,
+        MAX(CASE WHEN quarter_flag = 'Q4_2024' THEN avg_unit_price_quarter END) AS avg_price_q4_2024,
+        MAX(CASE WHEN quarter_flag = 'Q3_2025' THEN avg_unit_price_quarter END) AS avg_price_q3_2025,
+        MAX(CASE WHEN quarter_flag = 'Q4_2025' THEN avg_unit_price_quarter END) AS avg_price_q4_2025,
+        MAX(CASE WHEN quarter_flag = 'Q3_2024' THEN total_spend_quarter END) AS spend_q3_2024,
+        MAX(CASE WHEN quarter_flag = 'Q4_2024' THEN total_spend_quarter END) AS spend_q4_2024,
+        MAX(CASE WHEN quarter_flag = 'Q3_2025' THEN total_spend_quarter END) AS spend_q3_2025,
+        MAX(CASE WHEN quarter_flag = 'Q4_2025' THEN total_spend_quarter END) AS spend_q4_2025
+    FROM target_quarterly_data q
+    LEFT JOIN last_price_pre_q3_2024 lp
+        USING (product_id, product_description, category_name)
+    GROUP BY 1,2,3,4, lp.last_price_before_q3_2024
+),
+
+market_benchmark_2024 AS (
+    SELECT
+        product_id,
+        AVG(avg_unit_price) AS market_avg_unit_price_2024,
+        PERCENTILE_APPROX(avg_unit_price, 0.5) AS market_median_unit_price_2024,
+        COUNT(DISTINCT facility_name) AS facilities_buying_2024,
+        MIN(avg_unit_price) AS market_min_price_2024,
+        MAX(avg_unit_price) AS market_max_price_2024,
+        COUNT(DISTINCT DATE_TRUNC('MONTH', year_month)) AS months_with_data
+    FROM monthly_prices_clean
+    WHERE UPPER(facility_name) <> 'TARGET_FACILITY'
+      AND EXTRACT(YEAR FROM year_month) = 2024
+    GROUP BY product_id
+),
+
+market_benchmark_2025 AS (
+    SELECT
+        product_id,
+        MIN(avg_unit_price) AS market_min_price_2025,
+        MAX(avg_unit_price) AS market_max_price_2025
+    FROM monthly_prices_clean
+    WHERE UPPER(facility_name) <> 'TARGET_FACILITY'
+      AND EXTRACT(YEAR FROM year_month) = 2025
+    GROUP BY product_id
+),
+
+target_benchmark_2024 AS (
+    SELECT
+        product_id,
+        AVG(avg_unit_price) AS target_avg_unit_price_2024,
+        PERCENTILE_APPROX(avg_unit_price, 0.5) AS target_median_unit_price_2024,
+        MIN(avg_unit_price) AS target_min_price_2024,
+        MAX(avg_unit_price) AS target_max_price_2024
+    FROM monthly_prices_clean
+    WHERE UPPER(facility_name) = 'TARGET_FACILITY'
+      AND EXTRACT(YEAR FROM year_month) = 2024
+    GROUP BY product_id
+),
+
+target_current_avg AS (
+    SELECT
+        product_id,
+        AVG(avg_unit_price) AS target_current_avg_unit_price
+    FROM monthly_prices_clean
+    WHERE UPPER(facility_name) = 'TARGET_FACILITY'
+      AND year_month >= '2024-07-01'
+    GROUP BY product_id
+)
+
+SELECT
+    tqc.*,
+
+    tb.target_avg_unit_price_2024,
+    tb.target_median_unit_price_2024,
+    tb.target_min_price_2024,
+    tb.target_max_price_2024,
+
+    mb.market_avg_unit_price_2024,
+    mb.market_median_unit_price_2024,
+    mb.facilities_buying_2024,
+    mb.market_min_price_2024,
+    mb.market_max_price_2024,
+    mb.months_with_data,
+
+    mb25.market_min_price_2025,
+    mb25.market_max_price_2025,
+
+    tca.target_current_avg_unit_price,
+
+    TRY_DIVIDE(
+        tb.target_avg_unit_price_2024 - mb.market_avg_unit_price_2024,
+        mb.market_avg_unit_price_2024
+    ) * 100 AS target_2024_pct_vs_market_avg,
+
+    TRY_DIVIDE(
+        tb.target_avg_unit_price_2024 - mb.market_median_unit_price_2024,
+        mb.market_median_unit_price_2024
+    ) * 100 AS target_2024_pct_vs_market_median,
+
+    TRY_DIVIDE(
+        tca.target_current_avg_unit_price - mb.market_avg_unit_price_2024,
+        mb.market_avg_unit_price_2024
+    ) * 100 AS target_current_pct_vs_market_avg,
+
+    TRY_DIVIDE(
+        tca.target_current_avg_unit_price - mb.market_median_unit_price_2024,
+        mb.market_median_unit_price_2024
+    ) * 100 AS target_current_pct_vs_market_median,
+
+    CASE 
+        WHEN tca.target_current_avg_unit_price < mb.market_min_price_2024 THEN 'Below Market Range'
+        WHEN tca.target_current_avg_unit_price > mb.market_max_price_2024 THEN 'Above Market Range'
+        WHEN tca.target_current_avg_unit_price 
+             BETWEEN mb.market_min_price_2024 AND mb.market_max_price_2024
+             THEN 'Within Market Range'
+        ELSE 'Cannot Determine'
+    END AS current_price_position_vs_market_2024
+
+FROM target_quarter_comparison tqc
+LEFT JOIN target_benchmark_2024 tb ON tqc.product_id = tb.product_id
+LEFT JOIN market_benchmark_2024 mb ON tqc.product_id = mb.product_id
+LEFT JOIN market_benchmark_2025 mb25 ON tqc.product_id = mb25.product_id
+LEFT JOIN target_current_avg tca ON tqc.product_id = tca.product_id
+
+WHERE
+    mb.facilities_buying_2024 >= 5
+    AND mb.market_avg_unit_price_2024 IS NOT NULL
+    AND mb.market_median_unit_price_2024 IS NOT NULL
+    AND tb.target_avg_unit_price_2024 IS NOT NULL
+    AND tca.target_current_avg_unit_price IS NOT NULL
+
+ORDER BY target_current_pct_vs_market_avg DESC;
